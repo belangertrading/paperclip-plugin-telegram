@@ -22,6 +22,10 @@ export const DEFAULT_CONFIG = {
   escalationHoldMessage: "Let me check on that - I'll get back to you shortly.",
 } as const;
 
+export const MAX_AGENTS_PER_THREAD = 5;
+export const MAX_CONVERSATION_TURNS = 50;
+export const DEFAULT_CONVERSATION_TURNS = 10;
+
 export const METRIC_NAMES = {
   sent: "telegram_notifications_sent",
   failed: "telegram_notification_failures",

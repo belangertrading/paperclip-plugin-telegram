@@ -1,5 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { DEFAULT_CONFIG, PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
+import { DEFAULT_CONFIG, PLUGIN_ID, PLUGIN_VERSION, MAX_AGENTS_PER_THREAD } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -150,6 +150,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "Message sent to the user when their conversation is escalated to a human.",
         default: DEFAULT_CONFIG.escalationHoldMessage,
       },
+      maxAgentsPerThread: {
+        type: "number",
+        title: "Max Agents Per Thread",
+        description:
+          "Maximum number of concurrent ACP agent sessions allowed in a single thread.",
+        default: MAX_AGENTS_PER_THREAD,
+      },
     },
     required: ["telegramBotTokenRef", "defaultChatId"],
   },
@@ -165,6 +172,23 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check Escalation Timeouts",
       description: "Check for timed-out escalations and apply default actions.",
       schedule: "* * * * *",
+    },
+  ],
+  tools: [
+    {
+      toolKey: "escalate_to_human",
+      displayName: "Escalate to Human",
+      description: "Escalate a conversation to a human when you cannot handle it confidently",
+    },
+    {
+      toolKey: "handoff_to_agent",
+      displayName: "Handoff to Agent",
+      description: "Hand off work to another agent in this thread",
+    },
+    {
+      toolKey: "discuss_with_agent",
+      displayName: "Discuss with Agent",
+      description: "Start a back-and-forth conversation with another agent",
     },
   ],
 };

@@ -23,7 +23,14 @@ import {
   formatAgentRunFinished,
 } from "./formatters.js";
 import { handleCommand, getTopicForProject, BOT_COMMANDS } from "./commands.js";
-import { routeMessageToAcp, handleAcpOutput } from "./acp-bridge.js";
+import {
+  routeMessageToAcp,
+  handleAcpOutput,
+  handleHandoffToolCall,
+  handleDiscussToolCall,
+  handleHandoffApproval,
+  handleHandoffRejection,
+} from "./acp-bridge.js";
 import { METRIC_NAMES } from "./constants.js";
 import { TelegramAdapter } from "./adapter.js";
 import { EscalationManager } from "./escalation.js";
@@ -412,6 +419,41 @@ const plugin = definePlugin({
       return { content: JSON.stringify({ status: "escalated", escalationId }) };
     });
 
+    // --- Register handoff_to_agent tool ---
+    ctx.tools.register("handoff_to_agent", {
+      description: "Hand off work to another agent in this thread",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          targetAgent: { type: "string", description: "Name of agent to hand off to" },
+          reason: { type: "string", description: "Why you're handing off" },
+          contextSummary: { type: "string", description: "Summary for the target agent" },
+          requiresApproval: { type: "boolean", default: true, description: "Wait for human approval before target starts" },
+        },
+        required: ["targetAgent", "reason", "contextSummary"],
+      },
+    }, async (params: Record<string, unknown>) => {
+      return handleHandoffToolCall(ctx, token, params);
+    });
+
+    // --- Register discuss_with_agent tool ---
+    ctx.tools.register("discuss_with_agent", {
+      description: "Start a back-and-forth conversation with another agent",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          targetAgent: { type: "string", description: "Name of agent to discuss with" },
+          topic: { type: "string", description: "Discussion topic" },
+          initialMessage: { type: "string", description: "First message to send" },
+          maxTurns: { type: "number", default: 10, description: "Maximum conversation turns" },
+          humanCheckpointAt: { type: "number", description: "Pause for human approval at this turn" },
+        },
+        required: ["targetAgent", "topic", "initialMessage"],
+      },
+    }, async (params: Record<string, unknown>) => {
+      return handleDiscussToolCall(ctx, token, params);
+    });
+
     // --- Escalation timeout checker job ---
     ctx.jobs.register("check-escalation-timeouts", async () => {
       try {
@@ -462,7 +504,8 @@ async function handleUpdate(
   if (threadId) {
     const isAcpCommand = text.startsWith("/acp");
     if (!isAcpCommand) {
-      const routed = await routeMessageToAcp(ctx, chatId, threadId, text);
+      const replyToId = msg.reply_to_message?.message_id;
+      const routed = await routeMessageToAcp(ctx, chatId, threadId, text, replyToId);
       if (routed) return;
     }
   }
@@ -616,6 +659,20 @@ async function handleCallbackQuery(
     } catch (err) {
       await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
     }
+    return;
+  }
+
+  if (data.startsWith("handoff_approve_")) {
+    const handoffId = data.replace("handoff_approve_", "");
+    await handleHandoffApproval(ctx, token, handoffId, actor, query.id, chatId, messageId);
+    await answerCallbackQuery(ctx, token, query.id, "Handoff approved");
+    return;
+  }
+
+  if (data.startsWith("handoff_reject_")) {
+    const handoffId = data.replace("handoff_reject_", "");
+    await handleHandoffRejection(ctx, token, handoffId, actor, query.id, chatId, messageId);
+    await answerCallbackQuery(ctx, token, query.id, "Handoff rejected");
     return;
   }
 
