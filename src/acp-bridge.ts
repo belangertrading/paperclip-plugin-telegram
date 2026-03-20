@@ -1,10 +1,22 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js";
+import { MAX_AGENTS_PER_THREAD, DEFAULT_CONVERSATION_TURNS, MAX_CONVERSATION_TURNS } from "./constants.js";
+
+// --- Types ---
 
 type AcpBinding = {
   sessionId: string;
   agentName: string;
   boundAt: string;
+};
+
+type AcpSession = {
+  sessionId: string;
+  agentName: string;
+  agentDisplayName: string;
+  spawnedAt: string;
+  status: "active" | "closed";
+  lastActivityAt: string;
 };
 
 type AcpOutputEvent = {
@@ -14,6 +26,44 @@ type AcpOutputEvent = {
   text: string;
   done?: boolean;
 };
+
+type ConversationLoop = {
+  loopId: string;
+  initiatorSessionId: string;
+  targetSessionId: string;
+  initiatorAgent: string;
+  targetAgent: string;
+  topic: string;
+  maxTurns: number;
+  humanCheckpointAt?: number;
+  currentTurn: number;
+  lastOutputHash: string | null;
+  previousOutputHash: string | null;
+  status: "active" | "paused" | "completed";
+  chatId: string;
+  threadId: number;
+};
+
+type PendingHandoff = {
+  handoffId: string;
+  sourceSessionId: string;
+  sourceAgent: string;
+  targetAgent: string;
+  reason: string;
+  contextSummary: string;
+  chatId: string;
+  threadId: number;
+};
+
+type OutputQueueEntry = {
+  sessionId: string;
+  agentDisplayName: string;
+  text: string;
+  done: boolean;
+  queuedAt: number;
+};
+
+// --- ACP command handler ---
 
 export async function handleAcpCommand(
   ctx: PluginContext,
@@ -36,7 +86,7 @@ export async function handleAcpCommand(
       await handleAcpCancel(ctx, token, chatId, messageThreadId);
       break;
     case "close":
-      await handleAcpClose(ctx, token, chatId, messageThreadId);
+      await handleAcpClose(ctx, token, chatId, parts.slice(1).join(" ").trim(), messageThreadId);
       break;
     default:
       await sendMessage(
@@ -44,17 +94,19 @@ export async function handleAcpCommand(
         token,
         chatId,
         [
-          escapeMarkdownV2("🔌") + " *ACP Commands*",
+          escapeMarkdownV2("\ud83d\udd0c") + " *ACP Commands*",
           "",
           `/acp spawn <agent\\-name> \\- ${escapeMarkdownV2("Start a coding agent session in this thread")}`,
-          `/acp status \\- ${escapeMarkdownV2("Show current ACP session status")}`,
+          `/acp status \\- ${escapeMarkdownV2("Show all ACP sessions in this thread")}`,
           `/acp cancel \\- ${escapeMarkdownV2("Cancel the running agent task")}`,
-          `/acp close \\- ${escapeMarkdownV2("End the ACP session and unbind this thread")}`,
+          `/acp close [agent\\-name] \\- ${escapeMarkdownV2("End an ACP session (most recent if no name given)")}`,
         ].join("\n"),
         { parseMode: "MarkdownV2", messageThreadId },
       );
   }
 }
+
+// --- Spawn (multi-agent aware) ---
 
 async function handleAcpSpawn(
   ctx: PluginContext,
@@ -81,14 +133,17 @@ async function handleAcpSpawn(
     return;
   }
 
-  const existingBinding = await getAcpBinding(ctx, chatId, messageThreadId);
-  if (existingBinding) {
+  const sessions = await getSessions(ctx, chatId, messageThreadId);
+  const activeSessions = sessions.filter((s) => s.status === "active");
+
+  if (activeSessions.length >= MAX_AGENTS_PER_THREAD) {
+    const listing = activeSessions.map((s) => `  - ${s.agentDisplayName} (${s.sessionId})`).join("\n");
     await sendMessage(
       ctx,
       token,
       chatId,
-      `This thread already has an ACP session: \`${escapeMarkdownV2(existingBinding.sessionId)}\``,
-      { parseMode: "MarkdownV2", messageThreadId },
+      `Thread already has ${MAX_AGENTS_PER_THREAD} active agents (max):\n${listing}`,
+      { messageThreadId },
     );
     return;
   }
@@ -96,37 +151,61 @@ async function handleAcpSpawn(
   await sendChatAction(ctx, token, chatId);
 
   const sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const trimmedName = agentName.trim();
+  const displayName = trimmedName.charAt(0).toUpperCase() + trimmedName.slice(1);
+  const now = new Date().toISOString();
 
+  const newSession: AcpSession = {
+    sessionId,
+    agentName: trimmedName,
+    agentDisplayName: displayName,
+    spawnedAt: now,
+    status: "active",
+    lastActivityAt: now,
+  };
+
+  sessions.push(newSession);
+  await saveSessions(ctx, chatId, messageThreadId, sessions);
+
+  // Maintain legacy single-binding for backward compatibility
   await ctx.state.set(
     { scopeKind: "instance", stateKey: `acp_${chatId}_${messageThreadId}` },
-    { sessionId, agentName: agentName.trim(), boundAt: new Date().toISOString() } satisfies AcpBinding,
+    { sessionId, agentName: trimmedName, boundAt: now } satisfies AcpBinding,
   );
 
   ctx.events.emit("acp:message", {
     type: "spawn",
     sessionId,
-    agentName: agentName.trim(),
+    agentName: trimmedName,
     chatId,
     threadId: messageThreadId,
   });
+
+  const agentCount = activeSessions.length + 1;
+  const agentCountLine = agentCount > 1
+    ? `\n${escapeMarkdownV2(`${agentCount} agents now active in this thread. Use @${trimmedName} to address directly.`)}`
+    : "";
 
   await sendMessage(
     ctx,
     token,
     chatId,
     [
-      escapeMarkdownV2("🔌") + " *ACP Session Started*",
+      escapeMarkdownV2("\ud83d\udd0c") + " *ACP Session Started*",
       "",
-      `Agent: *${escapeMarkdownV2(agentName.trim())}*`,
+      `Agent: *${escapeMarkdownV2(displayName)}*`,
       `Session: \`${escapeMarkdownV2(sessionId)}\``,
       "",
       escapeMarkdownV2("Send messages in this thread to interact with the agent."),
+      agentCountLine,
     ].join("\n"),
     { parseMode: "MarkdownV2", messageThreadId },
   );
 
-  ctx.logger.info("ACP session spawned", { sessionId, agentName: agentName.trim(), chatId, threadId: messageThreadId });
+  ctx.logger.info("ACP session spawned", { sessionId, agentName: trimmedName, chatId, threadId: messageThreadId });
 }
+
+// --- Status (multi-agent aware) ---
 
 async function handleAcpStatus(
   ctx: PluginContext,
@@ -141,28 +220,38 @@ async function handleAcpStatus(
     return;
   }
 
-  const binding = await getAcpBinding(ctx, chatId, messageThreadId);
-  if (!binding) {
-    await sendMessage(ctx, token, chatId, "No ACP session bound to this thread.", {
+  const sessions = await getSessions(ctx, chatId, messageThreadId);
+  const activeSessions = sessions.filter((s) => s.status === "active");
+
+  if (activeSessions.length === 0) {
+    await sendMessage(ctx, token, chatId, "No ACP sessions bound to this thread.", {
       messageThreadId,
     });
     return;
   }
 
-  await sendMessage(
-    ctx,
-    token,
-    chatId,
-    [
-      escapeMarkdownV2("🔌") + " *ACP Session*",
+  const lines = [
+    escapeMarkdownV2("\ud83d\udd0c") + ` *ACP Sessions \\(${activeSessions.length}\\)*`,
+    "",
+  ];
+
+  for (const session of activeSessions) {
+    lines.push(
+      `${escapeMarkdownV2("\ud83e\udd16")} *${escapeMarkdownV2(session.agentDisplayName)}*`,
+      `  Session: \`${escapeMarkdownV2(session.sessionId)}\``,
+      `  Started: ${escapeMarkdownV2(session.spawnedAt)}`,
+      `  Last active: ${escapeMarkdownV2(session.lastActivityAt)}`,
       "",
-      `Agent: *${escapeMarkdownV2(binding.agentName)}*`,
-      `Session: \`${escapeMarkdownV2(binding.sessionId)}\``,
-      `Started: ${escapeMarkdownV2(binding.boundAt)}`,
-    ].join("\n"),
-    { parseMode: "MarkdownV2", messageThreadId },
-  );
+    );
+  }
+
+  await sendMessage(ctx, token, chatId, lines.join("\n"), {
+    parseMode: "MarkdownV2",
+    messageThreadId,
+  });
 }
+
+// --- Cancel ---
 
 async function handleAcpCancel(
   ctx: PluginContext,
@@ -196,17 +285,20 @@ async function handleAcpCancel(
     ctx,
     token,
     chatId,
-    `${escapeMarkdownV2("⏹")} Cancellation requested for session \`${escapeMarkdownV2(binding.sessionId)}\``,
+    `${escapeMarkdownV2("\u23f9")} Cancellation requested for session \`${escapeMarkdownV2(binding.sessionId)}\``,
     { parseMode: "MarkdownV2", messageThreadId },
   );
 
   ctx.logger.info("ACP cancel requested", { sessionId: binding.sessionId, chatId, threadId: messageThreadId });
 }
 
+// --- Close (multi-agent aware) ---
+
 async function handleAcpClose(
   ctx: PluginContext,
   token: string,
   chatId: string,
+  targetAgentName: string,
   messageThreadId?: number,
 ): Promise<void> {
   if (!messageThreadId) {
@@ -216,75 +308,797 @@ async function handleAcpClose(
     return;
   }
 
-  const binding = await getAcpBinding(ctx, chatId, messageThreadId);
-  if (!binding) {
-    await sendMessage(ctx, token, chatId, "No ACP session bound to this thread.", {
+  const sessions = await getSessions(ctx, chatId, messageThreadId);
+  const activeSessions = sessions.filter((s) => s.status === "active");
+
+  if (activeSessions.length === 0) {
+    await sendMessage(ctx, token, chatId, "No ACP sessions bound to this thread.", {
       messageThreadId,
     });
     return;
   }
 
+  let targetSession: AcpSession | undefined;
+
+  if (targetAgentName) {
+    const lowerTarget = targetAgentName.toLowerCase();
+    targetSession = activeSessions.find((s) => s.agentName.toLowerCase() === lowerTarget);
+    if (!targetSession) {
+      targetSession = activeSessions.find((s) => s.agentName.toLowerCase().includes(lowerTarget));
+    }
+    if (!targetSession) {
+      const listing = activeSessions.map((s) => `  - ${s.agentDisplayName}`).join("\n");
+      await sendMessage(
+        ctx,
+        token,
+        chatId,
+        `No agent named "${targetAgentName}" found. Active agents:\n${listing}`,
+        { messageThreadId },
+      );
+      return;
+    }
+  } else {
+    // Close most recently active
+    targetSession = activeSessions.sort(
+      (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+    )[0]!;
+  }
+
   ctx.events.emit("acp:message", {
     type: "close",
-    sessionId: binding.sessionId,
+    sessionId: targetSession.sessionId,
     chatId,
     threadId: messageThreadId,
   });
 
-  await ctx.state.set(
-    { scopeKind: "instance", stateKey: `acp_${chatId}_${messageThreadId}` },
-    null,
-  );
+  // Mark closed in sessions array
+  const idx = sessions.findIndex((s) => s.sessionId === targetSession!.sessionId);
+  if (idx >= 0) {
+    sessions[idx]!.status = "closed";
+  }
+  await saveSessions(ctx, chatId, messageThreadId, sessions);
+
+  // Update legacy binding to point to next most recent active, or clear it
+  const remaining = sessions.filter((s) => s.status === "active");
+  if (remaining.length > 0) {
+    const latest = remaining.sort(
+      (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+    )[0]!;
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `acp_${chatId}_${messageThreadId}` },
+      { sessionId: latest.sessionId, agentName: latest.agentName, boundAt: latest.spawnedAt } satisfies AcpBinding,
+    );
+  } else {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `acp_${chatId}_${messageThreadId}` },
+      null,
+    );
+  }
 
   await sendMessage(
     ctx,
     token,
     chatId,
-    `${escapeMarkdownV2("🔌")} ACP session \`${escapeMarkdownV2(binding.sessionId)}\` closed\\.`,
+    `${escapeMarkdownV2("\ud83d\udd0c")} ACP session for *${escapeMarkdownV2(targetSession.agentDisplayName)}* closed\\.`,
     { parseMode: "MarkdownV2", messageThreadId },
   );
 
-  ctx.logger.info("ACP session closed", { sessionId: binding.sessionId, chatId, threadId: messageThreadId });
+  ctx.logger.info("ACP session closed", {
+    sessionId: targetSession.sessionId,
+    agentName: targetSession.agentName,
+    chatId,
+    threadId: messageThreadId,
+  });
 }
+
+// --- Multi-agent message routing ---
 
 export async function routeMessageToAcp(
   ctx: PluginContext,
   chatId: string,
   threadId: number,
   text: string,
+  replyToMessageId?: number,
 ): Promise<boolean> {
-  const binding = await getAcpBinding(ctx, chatId, threadId);
-  if (!binding) return false;
+  const sessions = await getSessions(ctx, chatId, threadId);
+  const activeSessions = sessions.filter((s) => s.status === "active");
+
+  if (activeSessions.length === 0) {
+    // Fall back to legacy single binding
+    const binding = await getAcpBinding(ctx, chatId, threadId);
+    if (!binding) return false;
+
+    ctx.events.emit("acp:message", {
+      type: "message",
+      sessionId: binding.sessionId,
+      chatId,
+      threadId,
+      text,
+    });
+    ctx.logger.info("Routed message to ACP session", { sessionId: binding.sessionId, chatId, threadId });
+    return true;
+  }
+
+  let targetSession: AcpSession | undefined;
+
+  // 1) Check for @mention
+  const mentionMatch = text.match(/@(\w+)/);
+  if (mentionMatch) {
+    const mentionName = mentionMatch[1]!.toLowerCase();
+    targetSession = activeSessions.find(
+      (s) => s.agentName.toLowerCase() === mentionName || s.agentDisplayName.toLowerCase() === mentionName,
+    );
+    if (!targetSession) {
+      targetSession = activeSessions.find(
+        (s) => s.agentName.toLowerCase().includes(mentionName) || s.agentDisplayName.toLowerCase().includes(mentionName),
+      );
+    }
+  }
+
+  // 2) Check reply-to for agent message mapping
+  if (!targetSession && replyToMessageId) {
+    const agentMapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `agent_msg_${chatId}_${replyToMessageId}`,
+    }) as { sessionId: string } | null;
+
+    if (agentMapping) {
+      targetSession = activeSessions.find((s) => s.sessionId === agentMapping.sessionId);
+    }
+  }
+
+  // 3) Fallback: most recently active agent
+  if (!targetSession) {
+    targetSession = activeSessions.sort(
+      (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+    )[0]!;
+  }
+
+  // Update last activity
+  targetSession.lastActivityAt = new Date().toISOString();
+  const idx = sessions.findIndex((s) => s.sessionId === targetSession!.sessionId);
+  if (idx >= 0) {
+    sessions[idx] = targetSession;
+  }
+  await saveSessions(ctx, chatId, threadId, sessions);
 
   ctx.events.emit("acp:message", {
     type: "message",
-    sessionId: binding.sessionId,
+    sessionId: targetSession.sessionId,
     chatId,
     threadId,
     text,
   });
 
-  ctx.logger.info("Routed message to ACP session", { sessionId: binding.sessionId, chatId, threadId });
+  ctx.logger.info("Routed message to ACP session", {
+    sessionId: targetSession.sessionId,
+    agentName: targetSession.agentName,
+    chatId,
+    threadId,
+    routingMethod: mentionMatch ? "mention" : replyToMessageId ? "reply" : "fallback",
+  });
   return true;
 }
+
+// --- ACP output handler (sequenced, labeled) ---
 
 export async function handleAcpOutput(
   ctx: PluginContext,
   token: string,
   event: AcpOutputEvent,
 ): Promise<void> {
-  const { chatId, threadId, text, done } = event;
+  const { sessionId, chatId, threadId, text, done } = event;
 
+  // Look up agent display name from sessions
+  const sessions = await getSessions(ctx, chatId, threadId);
+  const session = sessions.find((s) => s.sessionId === sessionId);
+  const displayName = session?.agentDisplayName ?? "Agent";
+
+  // Update last activity
+  if (session) {
+    session.lastActivityAt = new Date().toISOString();
+    const idx = sessions.findIndex((s) => s.sessionId === sessionId);
+    if (idx >= 0) {
+      sessions[idx] = session;
+    }
+    await saveSessions(ctx, chatId, threadId, sessions);
+  }
+
+  // Check if multiple agents are active - if so, use output sequencing
+  const activeSessions = sessions.filter((s) => s.status === "active");
+  if (activeSessions.length > 1) {
+    const queued = await handleOutputSequencing(ctx, token, chatId, threadId, {
+      sessionId,
+      agentDisplayName: displayName,
+      text,
+      done: done ?? false,
+      queuedAt: Date.now(),
+    });
+    if (queued) return; // Output was queued, not sent yet
+  }
+
+  // Single agent or it's our turn - send directly
+  await sendLabeledOutput(ctx, token, chatId, threadId, sessionId, displayName, text, done);
+
+  // Check for conversation loop continuation
+  await checkConversationLoopContinuation(ctx, token, chatId, threadId, sessionId, text, done);
+}
+
+// --- Output sequencing ---
+
+async function handleOutputSequencing(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  threadId: number,
+  entry: OutputQueueEntry,
+): Promise<boolean> {
+  const speakerKey = `output_speaker_${chatId}_${threadId}`;
+  const queueKey = `output_queue_${chatId}_${threadId}`;
+
+  const currentSpeaker = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: speakerKey,
+  }) as string | null;
+
+  // If no one is speaking, or this agent is the speaker, send directly
+  if (!currentSpeaker || currentSpeaker === entry.sessionId) {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: speakerKey },
+      entry.sessionId,
+    );
+
+    // If done, flush next agent's queue
+    if (entry.done) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: speakerKey },
+        null,
+      );
+      await flushOutputQueue(ctx, token, chatId, threadId);
+    }
+
+    return false; // Not queued, caller should send
+  }
+
+  // Another agent is speaking - queue this output
+  const queue = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: queueKey,
+  }) as OutputQueueEntry[] | null) ?? [];
+
+  queue.push(entry);
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: queueKey },
+    queue,
+  );
+
+  return true; // Queued
+}
+
+async function flushOutputQueue(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  threadId: number,
+): Promise<void> {
+  const queueKey = `output_queue_${chatId}_${threadId}`;
+  const speakerKey = `output_speaker_${chatId}_${threadId}`;
+
+  const queue = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: queueKey,
+  }) as OutputQueueEntry[] | null) ?? [];
+
+  if (queue.length === 0) return;
+
+  // Group by session, send the first session's messages
+  const firstEntry = queue[0]!;
+  const nextSpeaker = firstEntry.sessionId;
+
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: speakerKey },
+    nextSpeaker,
+  );
+
+  const toSend: OutputQueueEntry[] = [];
+  const remaining: OutputQueueEntry[] = [];
+
+  for (const entry of queue) {
+    if (entry.sessionId === nextSpeaker) {
+      toSend.push(entry);
+    } else {
+      remaining.push(entry);
+    }
+  }
+
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: queueKey },
+    remaining,
+  );
+
+  for (const entry of toSend) {
+    await sendLabeledOutput(
+      ctx, token, chatId, threadId,
+      entry.sessionId, entry.agentDisplayName, entry.text, entry.done,
+    );
+
+    if (entry.done) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: speakerKey },
+        null,
+      );
+      await flushOutputQueue(ctx, token, chatId, threadId);
+      return;
+    }
+  }
+}
+
+// --- Send labeled output ---
+
+async function sendLabeledOutput(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  threadId: number,
+  sessionId: string,
+  displayName: string,
+  text: string,
+  done?: boolean,
+): Promise<void> {
   const prefix = done
-    ? escapeMarkdownV2("✅")
-    : escapeMarkdownV2("🤖");
+    ? escapeMarkdownV2("\u2705")
+    : escapeMarkdownV2("\ud83e\udd16");
 
-  const formatted = `${prefix} ${escapeMarkdownV2(text)}`;
+  const label = `*\\[${escapeMarkdownV2(displayName)}\\]*`;
+  const formatted = `${prefix} ${label} ${escapeMarkdownV2(text)}`;
 
-  await sendMessage(ctx, token, chatId, formatted, {
+  const messageId = await sendMessage(ctx, token, chatId, formatted, {
     parseMode: "MarkdownV2",
     messageThreadId: threadId,
   });
+
+  // Store message -> session mapping for reply routing
+  if (messageId) {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `agent_msg_${chatId}_${messageId}` },
+      { sessionId },
+    );
+  }
+}
+
+// --- Handoff tool handler ---
+
+export async function handleHandoffToolCall(
+  ctx: PluginContext,
+  token: string,
+  params: Record<string, unknown>,
+): Promise<{ content: string }> {
+  const sourceSessionId = String(params.sourceSessionId ?? "");
+  const targetAgent = String(params.targetAgent ?? "");
+  const reason = String(params.reason ?? "");
+  const contextSummary = String(params.contextSummary ?? "");
+  const requiresApproval = params.requiresApproval !== false;
+  const chatId = String(params.chatId ?? "");
+  const threadId = Number(params.threadId ?? 0);
+
+  if (!targetAgent || !chatId || !threadId) {
+    return { content: JSON.stringify({ error: "Missing required fields: targetAgent, chatId, threadId" }) };
+  }
+
+  const sessions = await getSessions(ctx, chatId, threadId);
+  const sourceSession = sessions.find((s) => s.sessionId === sourceSessionId);
+  const sourceAgent = sourceSession?.agentDisplayName ?? "Agent";
+
+  const handoffId = `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // Post handoff message
+  const handoffText = [
+    `${escapeMarkdownV2("\ud83d\udd04")} *\\[${escapeMarkdownV2(sourceAgent)}\\]* ${escapeMarkdownV2("Handing off to")} *${escapeMarkdownV2(targetAgent)}*`,
+    "",
+    `${escapeMarkdownV2("Reason:")} ${escapeMarkdownV2(reason)}`,
+  ].join("\n");
+
+  if (requiresApproval) {
+    await sendMessage(ctx, token, chatId, handoffText, {
+      parseMode: "MarkdownV2",
+      messageThreadId: threadId,
+      inlineKeyboard: [
+        [
+          { text: "Approve", callback_data: `handoff_approve_${handoffId}` },
+          { text: "Reject", callback_data: `handoff_reject_${handoffId}` },
+        ],
+      ],
+    });
+
+    // Store pending handoff
+    const pending: PendingHandoff = {
+      handoffId,
+      sourceSessionId,
+      sourceAgent,
+      targetAgent,
+      reason,
+      contextSummary,
+      chatId,
+      threadId,
+    };
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `handoff_${handoffId}` },
+      pending,
+    );
+
+    return { content: JSON.stringify({ status: "pending_approval", handoffId }) };
+  }
+
+  // No approval needed - execute immediately
+  await sendMessage(ctx, token, chatId, handoffText, {
+    parseMode: "MarkdownV2",
+    messageThreadId: threadId,
+  });
+
+  await executeHandoff(ctx, token, chatId, threadId, targetAgent, contextSummary, sessions);
+
+  return { content: JSON.stringify({ status: "handed_off", handoffId }) };
+}
+
+// --- Handoff callback handlers ---
+
+export async function handleHandoffApproval(
+  ctx: PluginContext,
+  token: string,
+  handoffId: string,
+  actor: string,
+  callbackQueryId: string,
+  chatId: string | null,
+  messageId: number | undefined,
+): Promise<void> {
+  const pending = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `handoff_${handoffId}`,
+  }) as PendingHandoff | null;
+
+  if (!pending) return;
+
+  const sessions = await getSessions(ctx, pending.chatId, pending.threadId);
+  await executeHandoff(ctx, token, pending.chatId, pending.threadId, pending.targetAgent, pending.contextSummary, sessions);
+
+  // Clean up
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: `handoff_${handoffId}` },
+    null,
+  );
+
+  ctx.logger.info("Handoff approved", { handoffId, actor, targetAgent: pending.targetAgent });
+}
+
+export async function handleHandoffRejection(
+  ctx: PluginContext,
+  token: string,
+  handoffId: string,
+  actor: string,
+  callbackQueryId: string,
+  chatId: string | null,
+  messageId: number | undefined,
+): Promise<void> {
+  const pending = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `handoff_${handoffId}`,
+  }) as PendingHandoff | null;
+
+  if (!pending) return;
+
+  await sendMessage(
+    ctx,
+    token,
+    pending.chatId,
+    `${escapeMarkdownV2("\u274c")} Handoff to *${escapeMarkdownV2(pending.targetAgent)}* rejected by ${escapeMarkdownV2(actor)}`,
+    { parseMode: "MarkdownV2", messageThreadId: pending.threadId },
+  );
+
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: `handoff_${handoffId}` },
+    null,
+  );
+
+  ctx.logger.info("Handoff rejected", { handoffId, actor, targetAgent: pending.targetAgent });
+}
+
+async function executeHandoff(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  threadId: number,
+  targetAgent: string,
+  contextSummary: string,
+  sessions: AcpSession[],
+): Promise<void> {
+  const activeSessions = sessions.filter((s) => s.status === "active");
+  const lowerTarget = targetAgent.toLowerCase();
+  let targetSession = activeSessions.find(
+    (s) => s.agentName.toLowerCase() === lowerTarget || s.agentDisplayName.toLowerCase() === lowerTarget,
+  );
+
+  if (!targetSession) {
+    // Auto-spawn the target agent
+    const sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const displayName = targetAgent.charAt(0).toUpperCase() + targetAgent.slice(1);
+    const now = new Date().toISOString();
+
+    targetSession = {
+      sessionId,
+      agentName: targetAgent,
+      agentDisplayName: displayName,
+      spawnedAt: now,
+      status: "active",
+      lastActivityAt: now,
+    };
+
+    sessions.push(targetSession);
+    await saveSessions(ctx, chatId, threadId, sessions);
+
+    ctx.events.emit("acp:message", {
+      type: "spawn",
+      sessionId,
+      agentName: targetAgent,
+      chatId,
+      threadId,
+    });
+
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      `${escapeMarkdownV2("\ud83d\udd0c")} Auto\\-spawned *${escapeMarkdownV2(displayName)}* for handoff`,
+      { parseMode: "MarkdownV2", messageThreadId: threadId },
+    );
+  }
+
+  // Send context to target agent
+  ctx.events.emit("acp:message", {
+    type: "message",
+    sessionId: targetSession.sessionId,
+    chatId,
+    threadId,
+    text: `[Handoff context] ${contextSummary}`,
+  });
+}
+
+// --- Discuss tool handler ---
+
+export async function handleDiscussToolCall(
+  ctx: PluginContext,
+  token: string,
+  params: Record<string, unknown>,
+): Promise<{ content: string }> {
+  const initiatorSessionId = String(params.initiatorSessionId ?? "");
+  const targetAgent = String(params.targetAgent ?? "");
+  const topic = String(params.topic ?? "");
+  const initialMessage = String(params.initialMessage ?? "");
+  const maxTurns = Math.min(Number(params.maxTurns ?? DEFAULT_CONVERSATION_TURNS), MAX_CONVERSATION_TURNS);
+  const humanCheckpointAt = params.humanCheckpointAt != null ? Number(params.humanCheckpointAt) : undefined;
+  const chatId = String(params.chatId ?? "");
+  const threadId = Number(params.threadId ?? 0);
+
+  if (!targetAgent || !initialMessage || !chatId || !threadId) {
+    return { content: JSON.stringify({ error: "Missing required fields: targetAgent, initialMessage, chatId, threadId" }) };
+  }
+
+  const sessions = await getSessions(ctx, chatId, threadId);
+  const activeSessions = sessions.filter((s) => s.status === "active");
+
+  // Find or spawn target
+  const lowerTarget = targetAgent.toLowerCase();
+  let targetSession = activeSessions.find(
+    (s) => s.agentName.toLowerCase() === lowerTarget || s.agentDisplayName.toLowerCase() === lowerTarget,
+  );
+
+  if (!targetSession) {
+    const sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const displayName = targetAgent.charAt(0).toUpperCase() + targetAgent.slice(1);
+    const now = new Date().toISOString();
+
+    targetSession = {
+      sessionId,
+      agentName: targetAgent,
+      agentDisplayName: displayName,
+      spawnedAt: now,
+      status: "active",
+      lastActivityAt: now,
+    };
+
+    sessions.push(targetSession);
+    await saveSessions(ctx, chatId, threadId, sessions);
+
+    ctx.events.emit("acp:message", {
+      type: "spawn",
+      sessionId,
+      agentName: targetAgent,
+      chatId,
+      threadId,
+    });
+
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      `${escapeMarkdownV2("\ud83d\udd0c")} Auto\\-spawned *${escapeMarkdownV2(displayName)}* for discussion`,
+      { parseMode: "MarkdownV2", messageThreadId: threadId },
+    );
+  }
+
+  const loopId = `loop_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  const loop: ConversationLoop = {
+    loopId,
+    initiatorSessionId,
+    targetSessionId: targetSession.sessionId,
+    initiatorAgent: sessions.find((s) => s.sessionId === initiatorSessionId)?.agentDisplayName ?? "Agent",
+    targetAgent: targetSession.agentDisplayName,
+    topic,
+    maxTurns,
+    humanCheckpointAt,
+    currentTurn: 0,
+    lastOutputHash: null,
+    previousOutputHash: null,
+    status: "active",
+    chatId,
+    threadId,
+  };
+
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: `loop_${chatId}_${threadId}` },
+    loop,
+  );
+
+  // Announce the discussion
+  await sendMessage(
+    ctx,
+    token,
+    chatId,
+    [
+      `${escapeMarkdownV2("\ud83d\udcac")} *Discussion Started*`,
+      "",
+      `Topic: ${escapeMarkdownV2(topic)}`,
+      `Between: *${escapeMarkdownV2(loop.initiatorAgent)}* and *${escapeMarkdownV2(loop.targetAgent)}*`,
+      `Max turns: ${escapeMarkdownV2(String(maxTurns))}`,
+      humanCheckpointAt ? `Human checkpoint at turn: ${escapeMarkdownV2(String(humanCheckpointAt))}` : "",
+    ].filter(Boolean).join("\n"),
+    { parseMode: "MarkdownV2", messageThreadId: threadId },
+  );
+
+  // Send initial message to target
+  ctx.events.emit("acp:message", {
+    type: "message",
+    sessionId: targetSession.sessionId,
+    chatId,
+    threadId,
+    text: `[Discussion: ${topic}] ${initialMessage}`,
+  });
+
+  return { content: JSON.stringify({ status: "started", loopId, maxTurns }) };
+}
+
+// --- Conversation loop continuation ---
+
+async function checkConversationLoopContinuation(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+  threadId: number,
+  sessionId: string,
+  text: string,
+  done?: boolean,
+): Promise<void> {
+  const loop = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `loop_${chatId}_${threadId}`,
+  }) as ConversationLoop | null;
+
+  if (!loop || loop.status !== "active") return;
+
+  // Check if this output is from one of the participants
+  const isInitiator = sessionId === loop.initiatorSessionId;
+  const isTarget = sessionId === loop.targetSessionId;
+  if (!isInitiator && !isTarget) return;
+
+  loop.currentTurn += 1;
+
+  // Stale loop detection: hash the output
+  const outputHash = simpleHash(text);
+  if (outputHash === loop.lastOutputHash && outputHash === loop.previousOutputHash) {
+    loop.status = "paused";
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `loop_${chatId}_${threadId}` },
+      loop,
+    );
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      `${escapeMarkdownV2("\u26a0\ufe0f")} *Discussion Paused* \\- Stale loop detected \\(same output repeated\\)\\. Send a message to resume\\.`,
+      { parseMode: "MarkdownV2", messageThreadId: threadId },
+    );
+    return;
+  }
+
+  loop.previousOutputHash = loop.lastOutputHash;
+  loop.lastOutputHash = outputHash;
+
+  // Max turns check
+  if (loop.currentTurn >= loop.maxTurns) {
+    loop.status = "completed";
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `loop_${chatId}_${threadId}` },
+      loop,
+    );
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      `${escapeMarkdownV2("\u2705")} *Discussion Completed* \\- Reached ${escapeMarkdownV2(String(loop.maxTurns))} turns\\.`,
+      { parseMode: "MarkdownV2", messageThreadId: threadId },
+    );
+    return;
+  }
+
+  // Human checkpoint check
+  if (loop.humanCheckpointAt && loop.currentTurn === loop.humanCheckpointAt) {
+    loop.status = "paused";
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `loop_${chatId}_${threadId}` },
+      loop,
+    );
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      `${escapeMarkdownV2("\u270b")} *Discussion Paused* at turn ${escapeMarkdownV2(String(loop.currentTurn))} for human review\\. Send a message to resume\\.`,
+      { parseMode: "MarkdownV2", messageThreadId: threadId },
+    );
+    return;
+  }
+
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: `loop_${chatId}_${threadId}` },
+    loop,
+  );
+
+  // Route to the OTHER participant (only if not done)
+  if (!done) {
+    const nextSessionId = isInitiator ? loop.targetSessionId : loop.initiatorSessionId;
+    ctx.events.emit("acp:message", {
+      type: "message",
+      sessionId: nextSessionId,
+      chatId,
+      threadId,
+      text: `[Discussion: ${loop.topic}] ${text}`,
+    });
+  }
+}
+
+// --- Session state helpers ---
+
+async function getSessions(
+  ctx: PluginContext,
+  chatId: string,
+  threadId: number,
+): Promise<AcpSession[]> {
+  const sessions = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `sessions_${chatId}_${threadId}`,
+  }) as AcpSession[] | null;
+  return sessions ?? [];
+}
+
+async function saveSessions(
+  ctx: PluginContext,
+  chatId: string,
+  threadId: number,
+  sessions: AcpSession[],
+): Promise<void> {
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: `sessions_${chatId}_${threadId}` },
+    sessions,
+  );
 }
 
 async function getAcpBinding(
@@ -297,4 +1111,14 @@ async function getAcpBinding(
     stateKey: `acp_${chatId}_${threadId}`,
   }) as AcpBinding | null;
   return binding;
+}
+
+function simpleHash(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return String(hash);
 }
