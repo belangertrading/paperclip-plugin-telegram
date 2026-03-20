@@ -39,8 +39,15 @@ Find the `chat.id` field in the response. For groups, the ID is a negative numbe
 ### 3. Install the plugin
 
 ```bash
-# From your Paperclip directory
-pnpm paperclipai plugin install /path/to/paperclip-plugin-telegram
+npm install paperclip-plugin-telegram
+```
+
+Or register with your Paperclip instance directly:
+
+```bash
+curl -X POST http://127.0.0.1:3100/api/plugins/install \
+  -H "Content-Type: application/json" \
+  -d '{"packageName":"paperclip-plugin-telegram"}'
 ```
 
 ### 4. Configure
