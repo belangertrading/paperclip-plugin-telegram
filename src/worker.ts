@@ -21,6 +21,7 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  type IssueLinksOpts,
 } from "./formatters.js";
 import { handleCommand, getTopicForProject, BOT_COMMANDS } from "./commands.js";
 import {
@@ -193,9 +194,21 @@ const plugin = definePlugin({
 
     // --- Event subscriptions ---
 
+    const issuePrefixCache = new Map<string, string>();
+
+    async function resolveIssueLinksOpts(companyId: string): Promise<IssueLinksOpts> {
+      let prefix = issuePrefixCache.get(companyId);
+      if (!prefix) {
+        const company = await ctx.companies.get(companyId);
+        prefix = company?.issuePrefix ?? "";
+        if (prefix) issuePrefixCache.set(companyId, prefix);
+      }
+      return { baseUrl, issuePrefix: prefix || undefined };
+    }
+
     const notify = async (
       event: PluginEvent,
-      formatter: (e: PluginEvent) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
+      formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
     ) => {
       const chatId = await resolveChat(
@@ -204,7 +217,8 @@ const plugin = definePlugin({
         overrideChatId || config.defaultChatId,
       );
       if (!chatId) return;
-      const msg = formatter(event);
+      const linksOpts = await resolveIssueLinksOpts(event.companyId);
+      const msg = formatter(event, linksOpts);
 
       let messageThreadId: number | undefined;
       if (config.topicRouting) {
