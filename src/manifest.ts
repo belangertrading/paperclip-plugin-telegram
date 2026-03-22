@@ -47,9 +47,9 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       defaultChatId: {
         type: "string",
-        title: "Default Chat ID",
+        title: "Default Chat ID (fallback)",
         description:
-          "Telegram chat ID to send notifications to. Use a group chat ID (negative number) or a user chat ID.",
+          "Fallback Telegram chat ID for notifications when no per-company chat is configured. Use /connect in a chat to set per-company routing.",
         default: DEFAULT_CONFIG.defaultChatId,
       },
       approvalsChatId: {
@@ -195,7 +195,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.watchDeduplicationWindowMs,
       },
     },
-    required: ["telegramBotTokenRef", "defaultChatId"],
+    required: ["telegramBotTokenRef"],
   },
   jobs: [
     {

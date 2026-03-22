@@ -302,50 +302,55 @@ const plugin = definePlugin({
 
     if (config.dailyDigestEnabled) {
       ctx.jobs.register("telegram-daily-digest", async () => {
-        try {
-          const companies = await ctx.companies.list();
-          const companyId = companies[0]?.id ?? "";
-          const agents = await ctx.agents.list({ companyId });
-          const activeAgents = agents.filter((a: Agent) => a.status === "active");
-          const issues = await ctx.issues.list({ companyId, limit: 50 });
+        const companies = await ctx.companies.list();
+        for (const company of companies) {
+          const chatId = await resolveChat(ctx, company.id, config.defaultChatId);
+          if (!chatId) continue;
 
-          const now = Date.now();
-          const oneDayMs = 24 * 60 * 60 * 1000;
-          const completedToday = issues.filter((i: Issue) =>
-            i.status === "done" && i.completedAt && (now - new Date(i.completedAt).getTime()) < oneDayMs
-          );
-          const createdToday = issues.filter((i: Issue) =>
-            (now - new Date(i.createdAt).getTime()) < oneDayMs
-          );
+          try {
+            const agents = await ctx.agents.list({ companyId: company.id });
+            const activeAgents = agents.filter((a: Agent) => a.status === "active");
+            const issues = await ctx.issues.list({ companyId: company.id, limit: 50 });
 
-          const dateStr = new Date().toISOString().split("T")[0];
-          const lines = [
-            escapeMarkdownV2("\ud83d\udcca") + ` *Daily Digest \\- ${escapeMarkdownV2(dateStr!)}*`,
-            "",
-            `${escapeMarkdownV2("\u2705")} Tasks completed: *${completedToday.length}*`,
-            `${escapeMarkdownV2("\ud83d\udccb")} Tasks created: *${createdToday.length}*`,
-            `${escapeMarkdownV2("\ud83e\udd16")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
-          ];
+            const now = Date.now();
+            const oneDayMs = 24 * 60 * 60 * 1000;
+            const completedToday = issues.filter((i: Issue) =>
+              i.status === "done" && i.completedAt && (now - new Date(i.completedAt).getTime()) < oneDayMs
+            );
+            const createdToday = issues.filter((i: Issue) =>
+              (now - new Date(i.createdAt).getTime()) < oneDayMs
+            );
 
-          if (activeAgents.length > 0) {
-            const topAgent = activeAgents[0]!.name;
-            lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
+            const dateStr = new Date().toISOString().split("T")[0];
+            const companyLabel = company.name ? ` \\- ${escapeMarkdownV2(company.name)}` : "";
+            const lines = [
+              escapeMarkdownV2("\ud83d\udcca") + ` *Daily Digest${companyLabel} \\- ${escapeMarkdownV2(dateStr!)}*`,
+              "",
+              `${escapeMarkdownV2("\u2705")} Tasks completed: *${completedToday.length}*`,
+              `${escapeMarkdownV2("\ud83d\udccb")} Tasks created: *${createdToday.length}*`,
+              `${escapeMarkdownV2("\ud83e\udd16")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
+            ];
+
+            if (activeAgents.length > 0) {
+              const topAgent = activeAgents[0]!.name;
+              lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
+            }
+
+            await sendMessage(ctx, token, chatId, lines.join("\n"), {
+              parseMode: "MarkdownV2",
+            });
+          } catch (err) {
+            ctx.logger.error("Daily digest failed for company", { companyId: company.id, error: String(err) });
+            const text = [
+              escapeMarkdownV2("\ud83d\udcca") + " *Daily Digest*",
+              "",
+              escapeMarkdownV2("Could not generate digest. Check plugin logs for details."),
+            ].join("\n");
+
+            await sendMessage(ctx, token, chatId, text, {
+              parseMode: "MarkdownV2",
+            });
           }
-
-          await sendMessage(ctx, token, config.defaultChatId, lines.join("\n"), {
-            parseMode: "MarkdownV2",
-          });
-        } catch (err) {
-          ctx.logger.error("Daily digest failed", { error: String(err) });
-          const text = [
-            escapeMarkdownV2("\ud83d\udcca") + " *Daily Digest*",
-            "",
-            escapeMarkdownV2("Could not generate digest. Check plugin logs for details."),
-          ].join("\n");
-
-          await sendMessage(ctx, token, config.defaultChatId, text, {
-            parseMode: "MarkdownV2",
-          });
         }
       });
     }
@@ -398,7 +403,12 @@ const plugin = definePlugin({
       const timeoutMs = config.escalationTimeoutMs || 900000;
       const defaultAction = config.escalationDefaultAction || "defer";
 
-      if (!config.escalationChatId) {
+      const resolvedEscalationChatId = await resolveChat(
+        ctx,
+        runCtx.companyId,
+        config.escalationChatId,
+      );
+      if (!resolvedEscalationChatId) {
         ctx.logger.warn("Escalation received but no escalationChatId configured");
         return { error: "No escalation channel configured" };
       }
@@ -426,7 +436,7 @@ const plugin = definePlugin({
         sessionId: p.sessionId ? String(p.sessionId) : undefined,
       };
 
-      await escalationManager.create(ctx, token, escalationEvent, config.escalationChatId);
+      await escalationManager.create(ctx, token, escalationEvent, resolvedEscalationChatId);
 
       // Send hold message to the originating chat if configured
       if (config.escalationHoldMessage && escalationEvent.originChatId) {
@@ -543,9 +553,6 @@ const plugin = definePlugin({
   async onValidateConfig(config) {
     if (!config.telegramBotTokenRef || typeof config.telegramBotTokenRef !== "string") {
       return { ok: false, errors: ["telegramBotTokenRef is required"] };
-    }
-    if (!config.defaultChatId || typeof config.defaultChatId !== "string") {
-      return { ok: false, errors: ["defaultChatId is required"] };
     }
     return { ok: true };
   },
