@@ -278,9 +278,40 @@ const plugin = definePlugin({
     }
 
     if (config.notifyOnApprovalCreated) {
-      ctx.events.on("approval.created", (event: PluginEvent) =>
-        notify(event, formatApprovalCreated, config.approvalsChatId),
-      );
+      ctx.events.on("approval.created", async (event: PluginEvent) => {
+        const payload = event.payload as Record<string, unknown>;
+        // Enrich with linked issue details (event only has issueIds)
+        const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
+        if (issueIds.length > 0 && !payload.linkedIssues) {
+          try {
+            const issues = await Promise.all(
+              issueIds.slice(0, 5).map((id) => ctx.issues.get(id, event.companyId)),
+            );
+            payload.linkedIssues = issues
+              .filter(Boolean)
+              .map((i) => ({
+                identifier: i!.identifier,
+                title: i!.title,
+                status: i!.status,
+                priority: i!.priority,
+              }));
+            // Use first issue's title as the approval title if missing
+            if (!payload.title && issues[0]) {
+              payload.title = issues[0].identifier
+                ? `${issues[0].identifier}: ${issues[0].title}`
+                : issues[0].title;
+            }
+          } catch { /* best effort */ }
+        }
+        // Enrich agent name
+        if (payload.agentId && !payload.agentName) {
+          try {
+            const agent = await ctx.agents.get(String(payload.agentId), event.companyId);
+            if (agent) payload.agentName = agent.name;
+          } catch { /* best effort */ }
+        }
+        await notify(event, formatApprovalCreated, config.approvalsChatId);
+      });
     }
 
     if (config.notifyOnAgentError) {
