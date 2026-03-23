@@ -383,6 +383,11 @@ const plugin = definePlugin({
               (now - new Date(i.createdAt).getTime()) < oneDayMs
             );
 
+            const issuePrefix = company.issuePrefix;
+            const inProgress = issues.filter((i: Issue) => i.status === "in_progress");
+            const inReview = issues.filter((i: Issue) => i.status === "in_review");
+            const blocked = issues.filter((i: Issue) => i.status === "blocked");
+
             const dateStr = new Date().toISOString().split("T")[0];
             const companyLabel = company.name ? ` \\- ${escapeMarkdownV2(company.name)}` : "";
             const lines = [
@@ -396,6 +401,27 @@ const plugin = definePlugin({
             if (activeAgents.length > 0) {
               const topAgent = activeAgents[0]!.name;
               lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
+            }
+
+            const formatIssueItem = (i: Issue) => {
+              const id = i.identifier ?? i.id;
+              const idText = issuePrefix
+                ? `[${escapeMarkdownV2(id)}](${publicUrl}/${issuePrefix}/issues/${id})`
+                : escapeMarkdownV2(id);
+              return `  ${idText} \\- ${escapeMarkdownV2(i.title)}`;
+            };
+
+            if (inProgress.length > 0) {
+              lines.push("", `${escapeMarkdownV2("\ud83d\udd04")} *In Progress \\(${inProgress.length}\\)*`);
+              for (const i of inProgress.slice(0, 10)) lines.push(formatIssueItem(i));
+            }
+            if (inReview.length > 0) {
+              lines.push("", `${escapeMarkdownV2("\ud83d\udd0d")} *In Review \\(${inReview.length}\\)*`);
+              for (const i of inReview.slice(0, 10)) lines.push(formatIssueItem(i));
+            }
+            if (blocked.length > 0) {
+              lines.push("", `${escapeMarkdownV2("\ud83d\udeab")} *Blocked \\(${blocked.length}\\)*`);
+              for (const i of blocked.slice(0, 10)) lines.push(formatIssueItem(i));
             }
 
             await sendMessage(ctx, token, chatId, lines.join("\n"), {
