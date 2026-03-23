@@ -310,6 +310,14 @@ const plugin = definePlugin({
             if (agent) payload.agentName = agent.name;
           } catch { /* best effort */ }
         }
+        // Build a meaningful title if still missing
+        if (!payload.title || payload.title === "Approval Requested") {
+          const approvalType = String(payload.type ?? "unknown").replace(/_/g, " ");
+          const agentLabel = payload.agentName ? String(payload.agentName) : null;
+          payload.title = agentLabel
+            ? `${approvalType} — ${agentLabel}`
+            : approvalType;
+        }
         await notify(event, formatApprovalCreated, config.approvalsChatId);
       });
     }
