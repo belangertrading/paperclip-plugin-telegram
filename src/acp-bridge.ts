@@ -1,5 +1,6 @@
 import type { PluginContext, AgentSessionEvent } from "@paperclipai/plugin-sdk";
 import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js";
+import { truncateAtWord } from "./telegram-api.js";
 import {
   MAX_AGENTS_PER_THREAD,
   DEFAULT_CONVERSATION_TURNS,
@@ -128,7 +129,13 @@ export async function handleAcpCommand(
  * Resolve an agent by name/urlKey (case-insensitive).
  * The plugin SDK's `agents.get()` requires a UUID, so we list all agents
  * and match by name or urlKey.
+ *
+ * The SDK may return the agent UUID in `id`, `agentId`, or `_id` depending
+ * on the Paperclip version.  We pick the first field that looks like a UUID
+ * and fall back to `id` if none do (caller will get a clear error on create).
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function resolveAgentByName(
   ctx: PluginContext,
   name: string,
@@ -142,8 +149,71 @@ async function resolveAgentByName(
         a.name?.toLowerCase() === lower ||
         a.urlKey?.toLowerCase() === lower,
     );
-    return match ? { id: match.id, name: match.name } : null;
-  } catch {
+    if (!match) return null;
+
+    // Find the UUID — different SDK versions may use different field names
+    const candidateId = match.agentId ?? match._id ?? match.id;
+    const resolvedId = UUID_RE.test(String(candidateId)) ? String(candidateId) : String(match.id);
+
+    ctx.logger.info("Resolved agent by name", {
+      agentName: name,
+      resolvedId,
+      rawId: match.id,
+      rawAgentId: match.agentId,
+      hasUrlKey: !!match.urlKey,
+    });
+
+    return { id: resolvedId, name: match.name };
+  } catch (err) {
+    ctx.logger.error("Failed to resolve agent by name", { agentName: name, companyId, error: String(err) });
+    return null;
+  }
+}
+
+// --- Native prompt delivery via issue creation ---
+//
+// The Paperclip heartbeat system only delivers taskId/issueId/commentId to
+// agents — freeform prompts passed via sessions.sendMessage({ prompt }) are
+// silently dropped. To work around this, we create a lightweight issue whose
+// title IS the prompt and assign it to the agent. The agent wakes with
+// PAPERCLIP_TASK_ID pointing to that issue and can read the prompt from the
+// issue title + description.
+
+export async function wakeAgentWithIssue(
+  ctx: PluginContext,
+  agentId: string,
+  companyId: string,
+  promptText: string,
+  reason: string,
+): Promise<string | null> {
+  try {
+    const title = truncateAtWord(promptText.replace(/\n/g, " "), 200);
+    const description = promptText.length > 200 ? promptText : undefined;
+
+    const issue = await ctx.issues.create({
+      companyId,
+      title: `[Telegram] ${title}`,
+      description,
+      assigneeAgentId: agentId,
+    });
+
+    await ctx.issues.update(issue.id, { status: "todo" }, companyId);
+
+    ctx.logger.info("Created issue for native agent prompt delivery", {
+      issueId: issue.id,
+      agentId,
+      reason,
+      promptLength: promptText.length,
+    });
+
+    return issue.id;
+  } catch (err) {
+    ctx.logger.error("Failed to create issue for native prompt delivery", {
+      agentId,
+      companyId,
+      reason,
+      error: String(err),
+    });
     return null;
   }
 }
@@ -212,10 +282,17 @@ async function handleAcpSpawn(
       sessionId = session.sessionId;
       transport = "native";
       ctx.logger.info("Created native agent session", { agentId, sessionId });
-    } catch {
+    } catch (err) {
+      ctx.logger.error("Native session creation failed, falling back to ACP", {
+        agentId,
+        agentName: trimmedName,
+        companyId: resolvedCompanyId,
+        error: String(err),
+      });
       sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     }
   } else {
+    ctx.logger.warn("Agent not found by name, using ACP transport", { agentName: trimmedName, companyId: resolvedCompanyId });
     sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
@@ -533,67 +610,18 @@ export async function routeMessageToAgent(
 
   // Route via correct transport
   if (targetSession.transport === "native") {
-    try {
-      await ctx.agents.sessions.sendMessage(targetSession.sessionId, resolvedCompanyId, {
-        prompt: text,
-        reason: "telegram_message",
-        onEvent: (() => {
-          // Buffer assistant text and send only the final response
-          const assistantTextBuffer: string[] = [];
-
-          return (event: AgentSessionEvent) => {
-            if (event.eventType === "chunk" && event.message) {
-              const msg = event.message;
-              if (msg.startsWith("{")) {
-                try {
-                  const parsed = JSON.parse(msg);
-                  // Collect assistant text content from both Claude and Pi output formats.
-                  // Claude emits: { type: "assistant", message: { content: [...] } }
-                  // Pi emits:     { type: "message_end", message: { role: "assistant", content: [...] } }
-                  const isClaudeAssistant = parsed.type === "assistant" && parsed.message?.content;
-                  const isPiAssistant = parsed.type === "message_end"
-                    && parsed.message?.role === "assistant"
-                    && Array.isArray(parsed.message.content);
-                  if (isClaudeAssistant || isPiAssistant) {
-                    const textParts = (parsed.message.content as any[])
-                      .filter((c: any) => c.type === "text" && c.text)
-                      .map((c: any) => c.text);
-                    if (textParts.length > 0) {
-                      assistantTextBuffer.push(textParts.join("\n"));
-                    }
-                  }
-                } catch {
-                  // Not JSON — ignore non-structured output
-                }
-              }
-              // Drop all non-JSON chunks (system messages like "run started", "adapter invocation", etc.)
-            } else if (event.eventType === "done") {
-              const finalText = assistantTextBuffer.length > 0
-                ? assistantTextBuffer.join("\n\n")
-                : "";
-              if (finalText) {
-                handleAcpOutput(ctx, token, {
-                  sessionId: targetSession!.sessionId,
-                  chatId,
-                  threadId,
-                  text: finalText,
-                  done: true,
-                }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-              } else {
-                handleAcpOutput(ctx, token, {
-                  sessionId: targetSession!.sessionId,
-                  chatId,
-                  threadId,
-                  text: event.message ?? "Run completed",
-                  done: true,
-                }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-              }
-            }
-          };
-        })(),
+    const issueId = await wakeAgentWithIssue(
+      ctx,
+      targetSession.agentId,
+      resolvedCompanyId,
+      text,
+      "telegram_message",
+    );
+    if (!issueId) {
+      ctx.logger.error("Failed to deliver message to native agent — issue creation failed", {
+        sessionId: targetSession.sessionId,
+        agentId: targetSession.agentId,
       });
-    } catch (err) {
-      ctx.logger.error("Failed to send message to native session", { error: String(err) });
       return false;
     }
   } else {
@@ -1007,7 +1035,10 @@ async function executeHandoff(
         });
         sessionId = session.sessionId;
         transport = "native";
-      } catch {
+      } catch (err) {
+        ctx.logger.error("Native session creation failed during handoff, falling back to ACP", {
+          agentId, targetAgent, companyId, error: String(err),
+        });
         sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       }
     } else {
@@ -1052,14 +1083,13 @@ async function executeHandoff(
 
   // Send context to target agent
   if (targetSession.transport === "native") {
-    try {
-      await ctx.agents.sessions.sendMessage(targetSession.sessionId, companyId, {
-        prompt: `[Handoff context] ${contextSummary}`,
-        reason: "handoff",
-      });
-    } catch (err) {
-      ctx.logger.error("Failed to send handoff context to native session", { error: String(err) });
-    }
+    await wakeAgentWithIssue(
+      ctx,
+      targetSession.agentId,
+      companyId,
+      `[Handoff context] ${contextSummary}`,
+      "handoff",
+    );
   } else {
     ctx.events.emit(ACP_SPAWN_EVENT, companyId, {
       type: "message",
@@ -1116,7 +1146,10 @@ export async function handleDiscussToolCall(
         });
         sessionId = session.sessionId;
         transport = "native";
-      } catch {
+      } catch (err) {
+        ctx.logger.error("Native session creation failed during discussion, falling back to ACP", {
+          agentId, targetAgent, companyId, error: String(err),
+        });
         sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       }
     } else {
@@ -1200,14 +1233,13 @@ export async function handleDiscussToolCall(
 
   // Send initial message to target via correct transport
   if (targetSession.transport === "native") {
-    try {
-      await ctx.agents.sessions.sendMessage(targetSession.sessionId, companyId, {
-        prompt: `[Discussion: ${topic}] ${initialMessage}`,
-        reason: "discussion",
-      });
-    } catch (err) {
-      ctx.logger.error("Failed to send discussion message to native session", { error: String(err) });
-    }
+    await wakeAgentWithIssue(
+      ctx,
+      targetSession.agentId,
+      companyId,
+      `[Discussion: ${topic}] ${initialMessage}`,
+      "discussion",
+    );
   } else {
     ctx.events.emit(ACP_SPAWN_EVENT, companyId, {
       type: "message",
@@ -1313,14 +1345,13 @@ async function checkConversationLoopContinuation(
       const resolvedCompanyId = await resolveCompanyIdFromChat(ctx, chatId);
 
       if (nextSession.transport === "native") {
-        try {
-          await ctx.agents.sessions.sendMessage(nextSessionId, resolvedCompanyId, {
-            prompt: `[Discussion: ${loop.topic}] ${text}`,
-            reason: "discussion_turn",
-          });
-        } catch (err) {
-          ctx.logger.error("Failed to send discussion turn to native session", { error: String(err) });
-        }
+        await wakeAgentWithIssue(
+          ctx,
+          nextSession.agentId,
+          resolvedCompanyId,
+          `[Discussion: ${loop.topic}] ${text}`,
+          "discussion_turn",
+        );
       } else {
         ctx.events.emit(ACP_SPAWN_EVENT, resolvedCompanyId, {
           type: "message",
