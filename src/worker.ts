@@ -19,6 +19,7 @@ import {
 import {
   formatIssueCreated,
   formatIssueDone,
+  formatIssueAssigned,
   formatApprovalCreated,
   formatAgentError,
   formatAgentRunStarted,
@@ -50,6 +51,8 @@ type TelegramConfig = {
   paperclipPublicUrl: string;
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
+  notifyOnIssueAssigned: boolean;
+  onlyNotifyIfAssignedTo: string;
   notifyOnApprovalCreated: boolean;
   notifyOnAgentError: boolean;
   enableCommands: boolean;
@@ -107,6 +110,31 @@ type TelegramUpdate = {
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
+
+/**
+ * Shared 5s sliding-window dedupe for issue.updated handlers.
+ *
+ * Paperclip's core can emit duplicate `issue.updated` plugin events for a
+ * single PATCH (the route's logActivity plus side-effects from heartbeat
+ * reconciliation), so handlers must dedupe to avoid sending the same
+ * Telegram message twice.
+ */
+function makeUpdateDedupe(windowMs = 5_000, maxEntries = 500) {
+  const seen = new Map<string, number>();
+  return (key: string): boolean => {
+    const now = Date.now();
+    const last = seen.get(key);
+    if (last !== undefined && now - last < windowMs) return false;
+    seen.set(key, now);
+    if (seen.size > maxEntries) {
+      const cutoff = now - windowMs;
+      for (const [k, ts] of seen) {
+        if (ts < cutoff) seen.delete(k);
+      }
+    }
+    return true;
+  };
+}
 
 async function resolveChat(
   ctx: PluginContext,
@@ -316,9 +344,11 @@ const plugin = definePlugin({
     }
 
     if (config.notifyOnIssueDone) {
+      const doneDedupe = makeUpdateDedupe();
       ctx.events.on("issue.updated", async (event: PluginEvent) => {
         const payload = event.payload as Record<string, unknown>;
         if (payload.status !== "done") return;
+        if (!doneDedupe(`done|${event.entityId}`)) return;
         // Enrich with title if missing (issue.updated events often omit it)
         if (!payload.title && event.entityId) {
           try {
@@ -339,6 +369,48 @@ const plugin = definePlugin({
           } catch { /* best effort */ }
         }
         await notify(event, formatIssueDone);
+      });
+    }
+
+    if (config.notifyOnIssueAssigned) {
+      const assignmentDedupe = makeUpdateDedupe();
+
+      ctx.events.on("issue.updated", async (event: PluginEvent) => {
+        const payload = event.payload as Record<string, unknown>;
+        const prev = (payload._previous as Record<string, unknown> | undefined) ?? {};
+
+        const userChanged =
+          "assigneeUserId" in payload && payload.assigneeUserId !== prev.assigneeUserId;
+        const agentChanged =
+          "assigneeAgentId" in payload && payload.assigneeAgentId !== prev.assigneeAgentId;
+        if (!userChanged && !agentChanged) return;
+
+        if (config.onlyNotifyIfAssignedTo && payload.assigneeUserId !== config.onlyNotifyIfAssignedTo) {
+          return;
+        }
+
+        const dedupeKey = [
+          "assigned",
+          event.entityId,
+          String(prev.assigneeUserId ?? ""),
+          String(payload.assigneeUserId ?? ""),
+          String(prev.assigneeAgentId ?? ""),
+          String(payload.assigneeAgentId ?? ""),
+        ].join("|");
+        if (!assignmentDedupe(dedupeKey)) return;
+
+        if ((!payload.title || !payload.assigneeName) && event.entityId) {
+          try {
+            const issue = await ctx.issues.get(event.entityId, event.companyId);
+            if (issue) {
+              payload.title ??= issue.title;
+              const name = (issue as unknown as Record<string, unknown>).assigneeName;
+              if (name) payload.assigneeName ??= name;
+            }
+          } catch { /* best effort */ }
+        }
+
+        await notify(event, formatIssueAssigned);
       });
     }
 
