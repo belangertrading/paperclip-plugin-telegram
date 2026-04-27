@@ -42,6 +42,7 @@ import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
 import { METRIC_NAMES } from "./constants.js";
 import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
+import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -58,6 +59,8 @@ type TelegramConfig = {
   notifyOnAgentError: boolean;
   enableCommands: boolean;
   enableInbound: boolean;
+  allowedTelegramUserIds: string[];
+  allowedTelegramChatIds: string[];
   digestMode: "off" | "daily" | "bidaily" | "tridaily";
   dailyDigestTime: string;
   bidailySecondTime: string;
@@ -830,6 +833,10 @@ const plugin = definePlugin({
     if (!config.telegramBotTokenRef || typeof config.telegramBotTokenRef !== "string") {
       return { ok: false, errors: ["telegramBotTokenRef is required"] };
     }
+    const allowlistErrors = validateTelegramAllowlists(config);
+    if (allowlistErrors.length > 0) {
+      return { ok: false, errors: allowlistErrors };
+    }
     return { ok: true };
   },
 
@@ -846,6 +853,17 @@ async function handleUpdate(
   baseUrl: string,
   publicUrl?: string,
 ): Promise<void> {
+  if (!isTelegramUpdateAllowed(config, update)) {
+    const fromId = update.message?.from?.id ?? update.callback_query?.from.id;
+    const chatId = update.message?.chat.id ?? update.callback_query?.message?.chat.id;
+    ctx.logger.warn("Blocked unauthorized Telegram update", {
+      updateId: update.update_id,
+      fromId,
+      chatId,
+    });
+    return;
+  }
+
   if (update.callback_query) {
     await handleCallbackQuery(ctx, token, update.callback_query, baseUrl);
     return;
@@ -902,7 +920,7 @@ async function handleUpdate(
     if (handledCustom) return;
 
     // Built-in commands
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl);
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, companyId);
     return;
   }
 
